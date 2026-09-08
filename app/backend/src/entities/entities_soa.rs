@@ -4,9 +4,22 @@ use rayon::{
 };
 use wide::f32x16;
 
-const LANES: usize = 16;
+use crate::entities::entity_id::EntityId;
+
+const SIMD_LANES: usize = 16;
+
+#[derive(Clone, Copy, Debug)]
+struct EntitySlot {
+    generation: u32,
+    dense_index: u32,
+    alive: bool,
+}
 
 pub struct EntitiesSoa {
+    // Stable ID corresponding to each dense row.
+    entity_ids: Vec<EntityId>,
+
+    // Component columns.
     position_x: Vec<f32>,
     position_y: Vec<f32>,
 
@@ -18,23 +31,89 @@ pub struct EntitiesSoa {
 
     mass: Vec<f32>,
     inv_mass: Vec<f32>,
+
+    // Stable-ID table.
+    slots: Vec<EntitySlot>,
+
+    // Reusable stable-ID slots.
+    free_slots: Vec<u32>,
+
+    max_entities: usize,
 }
 
 impl EntitiesSoa {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(max_entities: usize) -> Self {
         Self {
-            position_x: Vec::with_capacity(capacity),
-            position_y: Vec::with_capacity(capacity),
+            entity_ids: Vec::with_capacity(max_entities),
 
-            velocity_x: Vec::with_capacity(capacity),
-            velocity_y: Vec::with_capacity(capacity),
+            position_x: Vec::with_capacity(max_entities),
+            position_y: Vec::with_capacity(max_entities),
 
-            force_x: Vec::with_capacity(capacity),
-            force_y: Vec::with_capacity(capacity),
+            velocity_x: Vec::with_capacity(max_entities),
+            velocity_y: Vec::with_capacity(max_entities),
 
-            mass: Vec::with_capacity(capacity),
-            inv_mass: Vec::with_capacity(capacity),
+            force_x: Vec::with_capacity(max_entities),
+            force_y: Vec::with_capacity(max_entities),
+
+            mass: Vec::with_capacity(max_entities),
+            inv_mass: Vec::with_capacity(max_entities),
+
+            slots: Vec::with_capacity(max_entities),
+            free_slots: Vec::with_capacity(max_entities),
+
+            max_entities,
         }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.entity_ids.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.entity_ids.is_empty()
+    }
+
+    #[inline]
+    pub fn entity_ids(&self) -> &[EntityId] {
+        &self.entity_ids
+    }
+
+    #[inline]
+    pub fn position_x(&self) -> &[f32] {
+        &self.position_x
+    }
+
+    #[inline]
+    pub fn position_y(&self) -> &[f32] {
+        &self.position_y
+    }
+
+    #[inline]
+    pub fn position_x_mut(&mut self) -> &mut [f32] {
+        &mut self.position_x
+    }
+
+    #[inline]
+    pub fn position_y_mut(&mut self) -> &mut [f32] {
+        &mut self.position_y
+    }
+
+    #[inline]
+    pub fn dense_index(&self, entity: EntityId) -> Option<usize> {
+        let slot = self.slots.get(entity.index as usize)?;
+
+        if !slot.alive || slot.generation != entity.generation {
+            return None;
+        }
+
+        Some(slot.dense_index as usize)
+    }
+
+    #[inline]
+    pub fn contains(&self, entity: EntityId) -> bool {
+        self.dense_index(entity).is_some()
     }
 
     pub fn add(
@@ -46,8 +125,38 @@ impl EntitiesSoa {
         force_x: f32,
         force_y: f32,
         mass: f32,
-    ) -> usize {
-        let loc = self.position_x.len();
+    ) -> EntityId {
+        assert!(
+            self.len() < self.max_entities,
+            "maximum entity count reached"
+        );
+
+        let dense_index = self.len() as u32;
+
+        let entity = if let Some(index) = self.free_slots.pop() {
+            let slot = &mut self.slots[index as usize];
+
+            debug_assert!(!slot.alive);
+
+            slot.alive = true;
+            slot.dense_index = dense_index;
+
+            EntityId::new(index, slot.generation)
+        } else {
+            let index = self.slots.len();
+
+            assert!(index <= u32::MAX as usize, "too many stable entity IDs");
+
+            self.slots.push(EntitySlot {
+                generation: 0,
+                dense_index,
+                alive: true,
+            });
+
+            EntityId::new(index as u32, 0)
+        };
+
+        self.entity_ids.push(entity);
 
         self.position_x.push(position_x);
         self.position_y.push(position_y);
@@ -61,50 +170,70 @@ impl EntitiesSoa {
         self.mass.push(mass);
         self.inv_mass.push(1.0 / mass);
 
-        loc
+        entity
     }
 
-    // pub fn remove(&mut self, index: usize) -> bool {
-    //     let len = self.position_x.len();
+    pub fn remove(&mut self, entity: EntityId) -> bool {
+        let stable_index = entity.index as usize;
 
-    //     if index >= len {
-    //         return false;
-    //     }
+        let Some(slot) = self.slots.get(stable_index).copied() else {
+            return false;
+        };
 
-    //     let last = len - 1;
+        if !slot.alive || slot.generation != entity.generation {
+            return false;
+        }
 
-    //     if index != last {
-    //         self.position_x.swap(index, last);
-    //         self.position_y.swap(index, last);
+        let dense_index = slot.dense_index as usize;
+        let last_dense_index = self.entity_ids.len() - 1;
 
-    //         self.velocity_x.swap(index, last);
-    //         self.velocity_y.swap(index, last);
+        if dense_index != last_dense_index {
+            let moved_entity = self.entity_ids[last_dense_index];
 
-    //         self.force_x.swap(index, last);
-    //         self.force_y.swap(index, last);
+            self.entity_ids.swap(dense_index, last_dense_index);
 
-    //         self.mass.swap(index, last);
-    //         self.inv_mass.swap(index, last);
-    //     }
+            self.position_x.swap(dense_index, last_dense_index);
+            self.position_y.swap(dense_index, last_dense_index);
 
-    //     self.position_x.pop();
-    //     self.position_y.pop();
+            self.velocity_x.swap(dense_index, last_dense_index);
+            self.velocity_y.swap(dense_index, last_dense_index);
 
-    //     self.velocity_x.pop();
-    //     self.velocity_y.pop();
+            self.force_x.swap(dense_index, last_dense_index);
+            self.force_y.swap(dense_index, last_dense_index);
 
-    //     self.force_x.pop();
-    //     self.force_y.pop();
+            self.mass.swap(dense_index, last_dense_index);
 
-    //     self.mass.pop();
+            // The entity moved from the end into dense_index.
+            self.slots[moved_entity.index as usize].dense_index = dense_index as u32;
+        }
 
-    //     true
-    // }
+        self.entity_ids.pop();
+
+        self.position_x.pop();
+        self.position_y.pop();
+
+        self.velocity_x.pop();
+        self.velocity_y.pop();
+
+        self.force_x.pop();
+        self.force_y.pop();
+
+        self.mass.pop();
+
+        let slot = &mut self.slots[stable_index];
+
+        slot.alive = false;
+        slot.generation = slot.generation.wrapping_add(1);
+
+        self.free_slots.push(entity.index);
+
+        true
+    }
 
     pub fn update_velocities(&mut self, dt: f32) {
         let dt_simd = f32x16::splat(dt);
 
-        let remainder = self.position_x.len() % LANES;
+        let remainder = self.position_x.len() % SIMD_LANES;
         let simd_len = self.position_x.len() - remainder;
 
         let (vx_simd, vx_tail) = self.velocity_x.split_at_mut(simd_len);
@@ -116,11 +245,11 @@ impl EntitiesSoa {
         let (im_simd, im_tail) = self.inv_mass.split_at(simd_len);
 
         vx_simd
-            .par_chunks_exact_mut(LANES)
-            .zip(vy_simd.par_chunks_exact_mut(LANES))
-            .zip(fx_simd.par_chunks_exact_mut(LANES))
-            .zip(fy_simd.par_chunks_exact_mut(LANES))
-            .zip(im_simd.par_chunks_exact(LANES))
+            .par_chunks_exact_mut(SIMD_LANES)
+            .zip(vy_simd.par_chunks_exact_mut(SIMD_LANES))
+            .zip(fx_simd.par_chunks_exact_mut(SIMD_LANES))
+            .zip(fy_simd.par_chunks_exact_mut(SIMD_LANES))
+            .zip(im_simd.par_chunks_exact(SIMD_LANES))
             .for_each(|((((vx, vy), fx), fy), im)| {
                 let vx_s = f32x16::from(&*vx);
                 let vy_s = f32x16::from(&*vy);
@@ -158,7 +287,7 @@ impl EntitiesSoa {
     pub fn update_positions(&mut self, dt: f32) {
         let dt_simd = f32x16::splat(dt);
 
-        let remainder = self.position_x.len() % LANES;
+        let remainder = self.position_x.len() % SIMD_LANES;
         let simd_len = self.position_x.len() - remainder;
 
         let (px_simd, px_tail) = self.position_x.split_at_mut(simd_len);
@@ -168,10 +297,10 @@ impl EntitiesSoa {
         let (vy_simd, vy_tail) = self.velocity_y.split_at(simd_len);
 
         px_simd
-            .par_chunks_exact_mut(LANES)
-            .zip(py_simd.par_chunks_exact_mut(LANES))
-            .zip(vx_simd.par_chunks_exact(LANES))
-            .zip(vy_simd.par_chunks_exact(LANES))
+            .par_chunks_exact_mut(SIMD_LANES)
+            .zip(py_simd.par_chunks_exact_mut(SIMD_LANES))
+            .zip(vx_simd.par_chunks_exact(SIMD_LANES))
+            .zip(vy_simd.par_chunks_exact(SIMD_LANES))
             .for_each(|(((px, py), vx), vy)| {
                 let px_v = f32x16::from(&*px);
                 let py_v = f32x16::from(&*py);

@@ -1,9 +1,6 @@
 use std::time::Instant;
 
-use crate::{
-    entities::entities_soa::EntitiesSoa,
-    global::{config::Config, time::Time},
-};
+use crate::global::{config::Config, time::Time, world::World};
 
 mod entities;
 mod global;
@@ -11,8 +8,7 @@ mod spatial_db;
 
 fn main() {
     let config = Config::get_instance();
-    let mut entities_soa = EntitiesSoa::new(config.max_entities);
-
+    let mut world = World::new();
     let mut time = Time::new();
 
     let start = Instant::now();
@@ -20,7 +16,13 @@ fn main() {
     (0..config.max_entities).for_each(|_i| {
         let position_x = fastrand::f32() * config.world_size;
         let position_y = fastrand::f32() * config.world_size;
-        entities_soa.add(position_x, position_y, 0.0, 0.0, 0.0, 0.0, 1.0);
+
+        let velocity_x = fastrand::f32();
+        let velocity_y = fastrand::f32();
+
+        world.add_entity(
+            position_x, position_y, velocity_x, velocity_y, 0.0, 0.0, 1.0,
+        );
     });
     println!("[INFO] Spawned in {:?}", start.elapsed());
 
@@ -31,10 +33,7 @@ fn main() {
         if time.can_run_fixed_update() {
             let fixed_delta = time.fixed_delta();
 
-            let start = Instant::now();
-            entities_soa.update_velocities(fixed_delta.as_secs_f32());
-            entities_soa.update_positions(fixed_delta.as_secs_f32());
-            println!("[INFO] Updated in {:?}", start.elapsed());
+            world.update(fixed_delta.as_secs_f32());
         }
 
         // run update here
