@@ -1,10 +1,13 @@
 use rayon::{
-    iter::{IndexedParallelIterator, ParallelIterator},
+    iter::{
+        IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator,
+        ParallelIterator,
+    },
     slice::{ParallelSlice, ParallelSliceMut},
 };
 use wide::f32x16;
 
-use crate::entities::entity_id::EntityId;
+use crate::{entities::entity_id::EntityId, global::config::Config};
 
 const SIMD_LANES: usize = 16;
 
@@ -17,20 +20,22 @@ struct EntitySlot {
 
 pub struct EntitiesSoa {
     // Stable ID corresponding to each dense row.
-    entity_ids: Vec<EntityId>,
+    pub entity_ids: Vec<EntityId>,
 
     // Component columns.
-    position_x: Vec<f32>,
-    position_y: Vec<f32>,
+    pub position_x: Vec<f32>,
+    pub position_y: Vec<f32>,
 
-    velocity_x: Vec<f32>,
-    velocity_y: Vec<f32>,
+    pub velocity_x: Vec<f32>,
+    pub velocity_y: Vec<f32>,
 
-    force_x: Vec<f32>,
-    force_y: Vec<f32>,
+    pub force_x: Vec<f32>,
+    pub force_y: Vec<f32>,
 
-    mass: Vec<f32>,
-    inv_mass: Vec<f32>,
+    pub mass: Vec<f32>,
+    pub inv_mass: Vec<f32>,
+
+    pub radius: Vec<f32>,
 
     // Stable-ID table.
     slots: Vec<EntitySlot>,
@@ -42,62 +47,35 @@ pub struct EntitiesSoa {
 }
 
 impl EntitiesSoa {
-    pub fn new(max_entities: usize) -> Self {
+    pub fn new() -> Self {
+        let config = Config::get_instance();
         Self {
-            entity_ids: Vec::with_capacity(max_entities),
+            entity_ids: Vec::with_capacity(config.max_entities),
 
-            position_x: Vec::with_capacity(max_entities),
-            position_y: Vec::with_capacity(max_entities),
+            position_x: Vec::with_capacity(config.max_entities),
+            position_y: Vec::with_capacity(config.max_entities),
 
-            velocity_x: Vec::with_capacity(max_entities),
-            velocity_y: Vec::with_capacity(max_entities),
+            velocity_x: Vec::with_capacity(config.max_entities),
+            velocity_y: Vec::with_capacity(config.max_entities),
 
-            force_x: Vec::with_capacity(max_entities),
-            force_y: Vec::with_capacity(max_entities),
+            force_x: Vec::with_capacity(config.max_entities),
+            force_y: Vec::with_capacity(config.max_entities),
 
-            mass: Vec::with_capacity(max_entities),
-            inv_mass: Vec::with_capacity(max_entities),
+            mass: Vec::with_capacity(config.max_entities),
+            inv_mass: Vec::with_capacity(config.max_entities),
 
-            slots: Vec::with_capacity(max_entities),
-            free_slots: Vec::with_capacity(max_entities),
+            radius: Vec::with_capacity(config.max_entities),
 
-            max_entities,
+            slots: Vec::with_capacity(config.max_entities),
+            free_slots: Vec::with_capacity(config.max_entities),
+
+            max_entities: config.max_entities,
         }
     }
 
     #[inline]
     pub fn len(&self) -> usize {
         self.entity_ids.len()
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.entity_ids.is_empty()
-    }
-
-    #[inline]
-    pub fn entity_ids(&self) -> &[EntityId] {
-        &self.entity_ids
-    }
-
-    #[inline]
-    pub fn position_x(&self) -> &[f32] {
-        &self.position_x
-    }
-
-    #[inline]
-    pub fn position_y(&self) -> &[f32] {
-        &self.position_y
-    }
-
-    #[inline]
-    pub fn position_x_mut(&mut self) -> &mut [f32] {
-        &mut self.position_x
-    }
-
-    #[inline]
-    pub fn position_y_mut(&mut self) -> &mut [f32] {
-        &mut self.position_y
     }
 
     #[inline]
@@ -125,7 +103,8 @@ impl EntitiesSoa {
         force_x: f32,
         force_y: f32,
         mass: f32,
-    ) -> EntityId {
+        radius: f32,
+    ) -> (EntityId, u32) {
         assert!(
             self.len() < self.max_entities,
             "maximum entity count reached"
@@ -170,42 +149,52 @@ impl EntitiesSoa {
         self.mass.push(mass);
         self.inv_mass.push(1.0 / mass);
 
-        entity
+        self.radius.push(radius);
+
+        (entity, dense_index)
     }
 
-    pub fn remove(&mut self, entity: EntityId) -> bool {
+    pub fn remove(&mut self, entity: EntityId) -> Option<(EntityId, u32)> {
         let stable_index = entity.index as usize;
 
-        let Some(slot) = self.slots.get(stable_index).copied() else {
-            return false;
-        };
+        let slot = self.slots.get(stable_index).copied()?;
 
         if !slot.alive || slot.generation != entity.generation {
-            return false;
+            return None;
         }
 
         let dense_index = slot.dense_index as usize;
         let last_dense_index = self.entity_ids.len() - 1;
 
-        if dense_index != last_dense_index {
-            let moved_entity = self.entity_ids[last_dense_index];
+        let moved_entity = if dense_index != last_dense_index {
+            let moved = self.entity_ids[last_dense_index];
 
             self.entity_ids.swap(dense_index, last_dense_index);
 
             self.position_x.swap(dense_index, last_dense_index);
+
             self.position_y.swap(dense_index, last_dense_index);
 
             self.velocity_x.swap(dense_index, last_dense_index);
+
             self.velocity_y.swap(dense_index, last_dense_index);
 
             self.force_x.swap(dense_index, last_dense_index);
+
             self.force_y.swap(dense_index, last_dense_index);
 
             self.mass.swap(dense_index, last_dense_index);
 
-            // The entity moved from the end into dense_index.
-            self.slots[moved_entity.index as usize].dense_index = dense_index as u32;
-        }
+            self.inv_mass.swap(dense_index, last_dense_index);
+
+            self.radius.swap(dense_index, last_dense_index);
+
+            self.slots[moved.index as usize].dense_index = dense_index as u32;
+
+            Some((moved, dense_index as u32))
+        } else {
+            None
+        };
 
         self.entity_ids.pop();
 
@@ -219,6 +208,9 @@ impl EntitiesSoa {
         self.force_y.pop();
 
         self.mass.pop();
+        self.inv_mass.pop();
+
+        self.radius.pop();
 
         let slot = &mut self.slots[stable_index];
 
@@ -227,7 +219,7 @@ impl EntitiesSoa {
 
         self.free_slots.push(entity.index);
 
-        true
+        moved_entity
     }
 
     pub fn update_velocities(&mut self, dt: f32) {
@@ -320,5 +312,47 @@ impl EntitiesSoa {
             px_tail[i] += vx_tail[i] * dt;
             py_tail[i] += vy_tail[i] * dt;
         }
+    }
+
+    pub fn apply_collision_deltas(
+        &mut self,
+        delta_velocity_x: &[f32],
+        delta_velocity_y: &[f32],
+        delta_position_x: &[f32],
+        delta_position_y: &[f32],
+    ) {
+        debug_assert_eq!(self.len(), delta_velocity_x.len());
+
+        debug_assert_eq!(self.len(), delta_velocity_y.len());
+
+        debug_assert_eq!(self.len(), delta_position_x.len());
+
+        debug_assert_eq!(self.len(), delta_position_y.len());
+
+        let Self {
+            position_x,
+            position_y,
+
+            velocity_x,
+            velocity_y,
+            ..
+        } = self;
+
+        position_x
+            .par_iter_mut()
+            .zip(position_y.par_iter_mut())
+            .zip(velocity_x.par_iter_mut())
+            .zip(velocity_y.par_iter_mut())
+            .zip(delta_position_x.par_iter())
+            .zip(delta_position_y.par_iter())
+            .zip(delta_velocity_x.par_iter())
+            .zip(delta_velocity_y.par_iter())
+            .for_each(|(((((((px, py), vx), vy), dpx), dpy), dvx), dvy)| {
+                *px += *dpx;
+                *py += *dpy;
+
+                *vx += *dvx;
+                *vy += *dvy;
+            });
     }
 }

@@ -1,14 +1,11 @@
-use std::cmp::Reverse;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
 };
-use rayon::slice::ParallelSliceMut;
 
-use crate::entities::entity_id::EntityId;
+use crate::{entities::entity_id::EntityId, global::config::Config};
 
-const INVALID_CELL: u32 = u32::MAX;
 const INVALID_LOCATION: u64 = u64::MAX;
 
 #[inline]
@@ -17,94 +14,114 @@ fn pack_location(cell: u32, slot: u32) -> u64 {
 }
 
 #[inline]
-fn unpack_location(value: u64) -> (u32, u32) {
-    ((value >> 32) as u32, value as u32)
+fn unpack_location(location: u64) -> (u32, u32) {
+    ((location >> 32) as u32, location as u32)
 }
 
-#[derive(Default)]
 pub struct GridCell {
-    pub entities: Vec<EntityId>,
+    pub entities: Vec<u32>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Move {
-    entity: EntityId,
-
-    // Old grid location.
-    from: u32,
-    slot: u32,
-
-    // New grid location.
-    to: u32,
+impl GridCell {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            entities: Vec::new(),
+        }
+    }
 }
 
 pub struct UniformGrid {
+    pub world_size: f32,
+
+    pub cell_size: f32,
     inv_cell_size: f32,
 
-    pub num_cells_1d: u32,
+    pub num_cells_axis: u32,
 
+    /*
+        Persistent cells.
+
+        Each entry is a DENSE SOA INDEX.
+    */
     cells: Vec<GridCell>,
 
     /*
-        One location per stable EntityId.
+        Stable EntityId -> (cell, slot)
 
-        Encoded as:
+        Packed:
 
-        upper 32 bits = cell
-        lower 32 bits = slot inside cell
+            upper 32 bits = cell
+            lower 32 bits = slot
     */
     locations: Vec<AtomicU64>,
 
     /*
-        Scratch destination cell for every stable entity.
+        Per-dense-index destination cell.
 
-        This is atomic only because the destination-detection pass
-        executes in parallel.
+        Reused every frame.
     */
-    next_cell: Vec<AtomicU32>,
+    next_cell: Vec<u32>,
 
     /*
-        Reused scratch array.
-
-        After prefix sum:
-
-        ranges[cell]     = first mover belonging to cell
-        ranges[cell + 1] = one-past-last mover
+        Reused movement buffers.
     */
-    ranges: Vec<usize>,
+    movers: Vec<u32>,
+    ordered_movers: Vec<u32>,
+
+    /*
+        Counting-sort style scratch.
+
+        destination_offsets[cell]
+        .. destination_offsets[cell + 1]
+
+        is the range occupied by entities
+        moving into that destination cell.
+    */
+    destination_offsets: Vec<usize>,
+    destination_cursors: Vec<usize>,
 }
 
 impl UniformGrid {
-    pub fn new(world_size: f32, cell_size: f32, max_entities: usize) -> Self {
-        assert!(world_size > 0.0);
-        assert!(cell_size > 0.0);
+    pub fn new() -> Self {
+        let config = Config::get_instance();
 
-        let inv_cell_size = 1.0 / cell_size;
-        let num_cells_1d = (world_size * inv_cell_size).ceil() as u32;
+        assert!(config.world_size > 0.0);
+        assert!(config.cell_size > 0.0);
 
-        let cell_count = (num_cells_1d * num_cells_1d) as usize;
+        let inv_cell_size = 1.0 / config.cell_size;
 
-        let cells = (0..cell_count).map(|_| GridCell::default()).collect();
+        let num_cells_axis = (config.world_size * inv_cell_size).ceil() as u32;
 
-        let locations = (0..max_entities)
+        let cell_count = num_cells_axis as usize * num_cells_axis as usize;
+
+        let cells = (0..cell_count).map(|_| GridCell::new()).collect();
+
+        let locations = (0..config.max_entities)
             .map(|_| AtomicU64::new(INVALID_LOCATION))
             .collect();
 
-        let next_cell = (0..max_entities)
-            .map(|_| AtomicU32::new(INVALID_CELL))
-            .collect();
-
         Self {
+            world_size: config.world_size,
+
+            cell_size: config.cell_size,
             inv_cell_size,
 
-            num_cells_1d,
+            num_cells_axis,
 
             cells,
 
             locations,
-            next_cell,
 
-            ranges: Vec::with_capacity(cell_count + 1),
+            next_cell: vec![0; config.max_entities],
+
+            movers: Vec::with_capacity(config.max_entities),
+
+            ordered_movers: Vec::with_capacity(config.max_entities),
+
+            destination_offsets: vec![0; cell_count + 1],
+
+            destination_cursors: vec![0; cell_count],
         }
     }
 
@@ -114,53 +131,43 @@ impl UniformGrid {
     }
 
     #[inline]
-    pub fn cell_index(&self, cell_x: u32, cell_y: u32) -> u32 {
-        debug_assert!(cell_x < self.num_cells_1d);
-        debug_assert!(cell_y < self.num_cells_1d);
-
-        cell_y * self.num_cells_1d + cell_x
+    pub fn cells(&self) -> &[GridCell] {
+        &self.cells
     }
 
     #[inline]
-    fn cell_from_position(&self, x: f32, y: f32) -> u32 {
-        let mut cell_x = (x * self.inv_cell_size).floor() as i32;
-        let mut cell_y = (y * self.inv_cell_size).floor() as i32;
-
-        cell_x = cell_x.clamp(0, self.num_cells_1d as i32 - 1);
-        cell_y = cell_y.clamp(0, self.num_cells_1d as i32 - 1);
-
-        self.cell_index(cell_x as u32, cell_y as u32)
+    pub fn cell_entities(&self, cell: usize) -> &[u32] {
+        &self.cells[cell].entities
     }
 
-    #[inline]
-    pub fn entities_in_cell(&self, cell_x: u32, cell_y: u32) -> &[EntityId] {
-        let cell = self.cell_index(cell_x, cell_y);
-        &self.cells[cell as usize].entities
+    #[inline(always)]
+    pub fn cell_index(&self, x: u32, y: u32) -> u32 {
+        y * self.num_cells_axis + x
     }
 
-    #[inline]
-    pub fn entity_location(&self, entity: EntityId) -> Option<(u32, u32)> {
-        let value = self.locations[entity.index as usize].load(Ordering::Relaxed);
+    #[inline(always)]
+    fn position_to_cell(&self, x: f32, y: f32) -> u32 {
+        let cx = (x * self.inv_cell_size)
+            .floor()
+            .clamp(0.0, self.num_cells_axis as f32 - 1.0) as u32;
 
-        if value == INVALID_LOCATION {
-            None
-        } else {
-            Some(unpack_location(value))
-        }
+        let cy = (y * self.inv_cell_size)
+            .floor()
+            .clamp(0.0, self.num_cells_axis as f32 - 1.0) as u32;
+
+        self.cell_index(cx, cy)
     }
 
-    pub fn insert(&mut self, entity: EntityId, x: f32, y: f32) {
-        let cell = self.cell_from_position(x, y);
+    pub fn insert(&mut self, entity: EntityId, dense_index: u32, x: f32, y: f32) {
+        let cell = self.position_to_cell(x, y);
 
         let entities = &mut self.cells[cell as usize].entities;
 
         let slot = entities.len() as u32;
 
-        entities.push(entity);
+        entities.push(dense_index);
 
         self.locations[entity.index as usize].store(pack_location(cell, slot), Ordering::Relaxed);
-
-        self.next_cell[entity.index as usize].store(cell, Ordering::Relaxed);
     }
 
     pub fn remove(&mut self, entity: EntityId) -> bool {
@@ -177,264 +184,306 @@ impl UniformGrid {
         let slot = slot as usize;
 
         debug_assert!(slot < entities.len());
-        debug_assert_eq!(entities[slot], entity);
 
-        let last_entity = entities.pop().unwrap();
+        let moved_dense = entities.pop().unwrap();
 
         if slot < entities.len() {
-            entities[slot] = last_entity;
+            entities[slot] = moved_dense;
 
-            self.locations[last_entity.index as usize]
+            /*
+                Find the stable ID of the entity that was
+                moved into this grid slot.
+
+                The caller owns the dense SoA, so this method
+                needs the dense -> EntityId table in a more
+                sophisticated implementation.
+
+                See `remove_with_entities()` below.
+            */
+        }
+
+        self.locations[entity.index as usize].store(INVALID_LOCATION, Ordering::Relaxed);
+
+        true
+    }
+
+    pub fn remove_with_entities(&mut self, entity: EntityId, entity_ids: &[EntityId]) -> bool {
+        let location = self.locations[entity.index as usize].load(Ordering::Relaxed);
+
+        if location == INVALID_LOCATION {
+            return false;
+        }
+
+        let (cell, slot) = unpack_location(location);
+
+        let entities = &mut self.cells[cell as usize].entities;
+
+        let slot = slot as usize;
+
+        debug_assert!(slot < entities.len());
+
+        debug_assert!(entities[slot] < entity_ids.len() as u32);
+
+        let last_dense = entities.pop().unwrap();
+
+        if slot < entities.len() {
+            entities[slot] = last_dense;
+
+            let moved_entity = entity_ids[last_dense as usize];
+
+            self.locations[moved_entity.index as usize]
                 .store(pack_location(cell, slot as u32), Ordering::Relaxed);
         }
 
         self.locations[entity.index as usize].store(INVALID_LOCATION, Ordering::Relaxed);
 
-        self.next_cell[entity.index as usize].store(INVALID_CELL, Ordering::Relaxed);
-
         true
     }
 
+    pub fn update_dense_index(&mut self, entity: EntityId, new_dense_index: u32) {
+        let location = self.locations[entity.index as usize].load(Ordering::Relaxed);
+
+        debug_assert_ne!(location, INVALID_LOCATION);
+
+        let (cell, slot) = unpack_location(location);
+
+        self.cells[cell as usize].entities[slot as usize] = new_dense_index;
+    }
+
     /*
-        Builds:
+        ------------------------------------------------------------
+        RELOCATION
+        ------------------------------------------------------------
 
-            ranges[i] = count of movers whose key == i
+        No sorting.
 
-        then converts counts into prefix sums.
-
-        After this:
-
-            ranges[i]..ranges[i + 1]
-
-        is the range belonging to cell i.
+        1. Determine destination cell for every dense entity.
+        2. Compact each current cell in parallel.
+        3. Collect movers.
+        4. Count destination cells.
+        5. Prefix sum.
+        6. Scatter movers into destination ranges.
+        7. Insert destination ranges in parallel.
     */
-    fn build_ranges_from_source(&mut self, movers: &Vec<Move>) {
-        self.ranges.fill(0);
+    pub fn relocate(&mut self, entity_ids: &[EntityId], position_x: &[f32], position_y: &[f32]) {
+        let entity_count = entity_ids.len();
 
-        for movement in movers {
-            self.ranges[movement.from as usize + 1] += 1;
+        if entity_count == 0 {
+            return;
         }
 
-        for i in 1..self.ranges.len() {
-            let previous = self.ranges[i - 1];
-            self.ranges[i] += previous;
-        }
-    }
-
-    fn build_ranges_from_destination(&mut self, movers: &Vec<Move>) {
-        self.ranges.fill(0);
-
-        for movement in movers {
-            self.ranges[movement.to as usize + 1] += 1;
-        }
-
-        for i in 1..self.ranges.len() {
-            let previous = self.ranges[i - 1];
-            self.ranges[i] += previous;
-        }
-    }
-
-    fn detect_moved_entities(
-        &self,
-        entity_ids: &[EntityId],
-        position_x: &[f32],
-        position_y: &[f32],
-    ) -> Vec<Move> {
-        let locations = &self.locations;
-        let next_cell = &self.next_cell;
+        /*
+            --------------------------------------------------------
+            1. Destination cell for every entity.
+            --------------------------------------------------------
+        */
 
         let inv_cell_size = self.inv_cell_size;
+        let num_cells_axis = self.num_cells_axis;
 
-        let num_cells_1d = self.num_cells_1d;
+        self.next_cell[..entity_count]
+            .par_iter_mut()
+            .zip(position_x[..entity_count].par_iter())
+            .zip(position_y[..entity_count].par_iter())
+            .for_each(|((destination, &x), &y)| {
+                let cx = (x * inv_cell_size)
+                    .floor()
+                    .clamp(0.0, num_cells_axis as f32 - 1.0) as u32;
 
-        let movers = entity_ids
-            .par_iter()
-            .enumerate()
-            .filter_map(|(dense_index, &entity)| {
-                let location = locations[entity.index as usize].load(Ordering::Relaxed);
+                let cy = (y * inv_cell_size)
+                    .floor()
+                    .clamp(0.0, num_cells_axis as f32 - 1.0) as u32;
 
-                debug_assert_ne!(location, INVALID_LOCATION);
+                *destination = cy * num_cells_axis + cx;
+            });
 
-                if location == INVALID_LOCATION {
-                    return None;
-                }
-
-                let (from, slot) = unpack_location(location);
-
-                let mut cell_x = (position_x[dense_index] * inv_cell_size).floor() as i32;
-                let mut cell_y = (position_y[dense_index] * inv_cell_size).floor() as i32;
-
-                cell_x = cell_x.clamp(0, num_cells_1d as i32 - 1);
-                cell_y = cell_y.clamp(0, num_cells_1d as i32 - 1);
-
-                let to = (cell_y as u32) * num_cells_1d + cell_x as u32;
-
-                next_cell[entity.index as usize].store(to, Ordering::Relaxed);
-
-                if from == to {
-                    None
-                } else {
-                    Some(Move {
-                        entity,
-                        from,
-                        slot,
-                        to,
-                    })
-                }
-            })
-            .collect::<Vec<_>>();
-
-        movers
-    }
-
-    fn remove_movers_parallel(&mut self, movers: &mut Vec<Move>) {
         /*
-            ---------------------------------------------------------
-            Sort movers by source cell and descending source slot.
+            --------------------------------------------------------
+            2. Remove movers from old cells.
 
-            Descending slot is important.
+            Each cell is exclusively owned by one Rayon worker.
 
-            If a cell contains:
+            Staying entities are compacted in-place.
 
-                [A B C D E F]
-
-            and B and E leave:
-
-                remove slot 4
-                remove slot 1
-
-            so earlier removals never invalidate a lower slot.
-            ---------------------------------------------------------
+            No swap_remove is used here because we're removing
+            potentially many entities from one cell.
+            --------------------------------------------------------
         */
 
-        movers.par_sort_unstable_by_key(|movement| (movement.from, Reverse(movement.slot)));
+        let next_cell = &self.next_cell;
 
-        self.build_ranges_from_source(&movers);
+        let locations = &self.locations;
 
-        self.cells
+        self.movers = self
+            .cells
             .par_iter_mut()
             .enumerate()
-            .for_each(|(cell_index, cell)| {
-                let start = self.ranges[cell_index];
+            .fold(
+                || Vec::<u32>::with_capacity(16),
+                |mut local, (cell_index, cell)| {
+                    let mut write = 0usize;
 
-                let end = self.ranges[cell_index + 1];
+                    let old_len = cell.entities.len();
 
-                if start == end {
-                    return;
-                }
+                    for read in 0..old_len {
+                        let dense = cell.entities[read];
 
-                let cell_index = cell_index as u32;
+                        let destination = next_cell[dense as usize];
 
-                for movement in &movers[start..end] {
-                    let slot = movement.slot as usize;
+                        if destination == cell_index as u32 {
+                            /*
+                                Entity stays in this cell.
 
-                    debug_assert_eq!(movement.from, cell_index);
-                    debug_assert!(slot < cell.entities.len());
-                    debug_assert_eq!(cell.entities[slot], movement.entity);
+                                Compact if necessary.
+                            */
+                            if write != read {
+                                cell.entities[write] = dense;
 
-                    let last_entity = cell.entities.pop().expect("grid cell unexpectedly empty");
+                                let entity = entity_ids[dense as usize];
 
-                    if slot < cell.entities.len() {
-                        cell.entities[slot] = last_entity;
+                                locations[entity.index as usize].store(
+                                    pack_location(cell_index as u32, write as u32),
+                                    Ordering::Relaxed,
+                                );
+                            }
 
-                        self.locations[last_entity.index as usize]
-                            .store(pack_location(cell_index, slot as u32), Ordering::Relaxed);
+                            write += 1;
+                        } else {
+                            /*
+                                Entity leaves this cell.
+                            */
+                            local.push(dense);
+                        }
                     }
 
-                    self.locations[movement.entity.index as usize]
-                        .store(INVALID_LOCATION, Ordering::Relaxed);
-                }
-            });
-    }
+                    cell.entities.truncate(write);
 
-    fn append_movers_parallel(&mut self, movers: &mut Vec<Move>) {
+                    local
+                },
+            )
+            .reduce(Vec::new, |mut a, mut b| {
+                a.append(&mut b);
+                a
+            });
+
+        if self.movers.is_empty() {
+            return;
+        }
+
         /*
-            ---------------------------------------------------------
-            PHASE 4
-            Sort movers by destination cell.
-            ---------------------------------------------------------
+            --------------------------------------------------------
+            3. Count movers per destination cell.
+
+            This replaces:
+
+                par_sort_unstable_by_key()
+
+            with a linear pass.
+            --------------------------------------------------------
         */
 
-        movers.par_sort_unstable_by_key(|movement| movement.to);
-        self.build_ranges_from_destination(&movers);
+        self.destination_offsets.fill(0);
+
+        for &dense in &self.movers {
+            let destination = self.next_cell[dense as usize] as usize;
+
+            self.destination_offsets[destination + 1] += 1;
+        }
+
+        /*
+            --------------------------------------------------------
+            4. Prefix sum.
+
+            After this:
+
+                offsets[cell] ..
+                offsets[cell + 1]
+
+            is the destination range.
+            --------------------------------------------------------
+        */
+
+        for cell in 1..self.destination_offsets.len() {
+            let previous = self.destination_offsets[cell - 1];
+
+            self.destination_offsets[cell] += previous;
+        }
+
+        /*
+            --------------------------------------------------------
+            5. Reusable cursors.
+            --------------------------------------------------------
+        */
+
+        self.destination_cursors
+            .copy_from_slice(&self.destination_offsets[..self.cells.len()]);
+
+        /*
+            --------------------------------------------------------
+            6. Scatter movers into destination ranges.
+
+            Still O(M).
+
+            No comparison sort.
+            --------------------------------------------------------
+        */
+
+        self.ordered_movers.resize(self.movers.len(), 0);
+
+        for &dense in &self.movers {
+            let destination = self.next_cell[dense as usize] as usize;
+
+            let slot = self.destination_cursors[destination];
+
+            self.ordered_movers[slot] = dense;
+
+            self.destination_cursors[destination] += 1;
+        }
+
+        /*
+            --------------------------------------------------------
+            7. Insert destination ranges in parallel.
+
+            Each destination cell is owned by exactly one worker.
+            --------------------------------------------------------
+        */
+
+        let ordered = &self.ordered_movers;
+
+        let offsets = &self.destination_offsets;
 
         self.cells
             .par_iter_mut()
             .enumerate()
             .for_each(|(cell_index, cell)| {
-                let start = self.ranges[cell_index];
-                let end = self.ranges[cell_index + 1];
+                let start = offsets[cell_index];
+
+                let end = offsets[cell_index + 1];
 
                 if start == end {
                     return;
                 }
 
-                let destination = cell_index as u32;
                 let incoming = end - start;
 
                 cell.entities.reserve(incoming);
 
                 let base_slot = cell.entities.len();
 
-                for (offset, movement) in movers[start..end].iter().enumerate() {
-                    debug_assert_eq!(movement.to, destination);
+                for offset in 0..incoming {
+                    let dense = ordered[start + offset];
 
                     let slot = base_slot + offset;
-                    cell.entities.push(movement.entity);
-                    self.locations[movement.entity.index as usize]
-                        .store(pack_location(destination, slot as u32), Ordering::Relaxed);
+
+                    cell.entities.push(dense);
+
+                    let entity = entity_ids[dense as usize];
+
+                    locations[entity.index as usize].store(
+                        pack_location(cell_index as u32, slot as u32),
+                        Ordering::Relaxed,
+                    );
                 }
             });
-    }
-
-    /*
-        Relocates all entities whose position crossed a cell boundary.
-
-        This does NOT rebuild the grid.
-
-        It only removes movers from their current cells and appends
-        them to their destination cells.
-    */
-    pub fn relocate(&mut self, entity_ids: &[EntityId], position_x: &[f32], position_y: &[f32]) {
-        debug_assert_eq!(entity_ids.len(), position_x.len());
-
-        debug_assert_eq!(entity_ids.len(), position_y.len());
-
-        /*
-            ---------------------------------------------------------
-            PHASE 1
-            Detect entities that changed cells.
-            ---------------------------------------------------------
-        */
-
-        let mut movers = self.detect_moved_entities(entity_ids, position_x, position_y);
-
-        if movers.is_empty() {
-            return;
-        }
-
-        /*
-            ---------------------------------------------------------
-            PHASE 2
-            Remove movers from source cells in parallel.
-
-            Each GridCell is exclusively owned by one Rayon worker
-            during this operation.
-            ---------------------------------------------------------
-        */
-
-        self.remove_movers_parallel(&mut movers);
-
-        /*
-            ---------------------------------------------------------
-            PHASE 3
-            Append movers to destination cells in parallel.
-
-            Each destination cell owns exactly one range in movers,
-            so there is no mutex and no atomic push.
-            ---------------------------------------------------------
-        */
-
-        self.append_movers_parallel(&mut movers);
     }
 }
