@@ -1,2 +1,2 @@
-pub mod uniform_grid;
-pub mod collision;
+pub mod grid_cell;
+pub mod grid_manager;

@@ -12,6 +12,7 @@ use crate::{
 pub const INVALID_SLOT: usize = usize::MAX;
 
 pub struct EntityManager {
+    simd_lanes: usize,
     storage: EntityStorage,
     id_to_slot: Vec<usize>, // EntityId Index to Entity Slot Location in storage arrays
     free_ids: Vec<EntityId>,
@@ -22,10 +23,23 @@ impl EntityManager {
         let config = Config::get_instance();
 
         Self {
+            simd_lanes: config.simd_lanes as usize,
             storage: EntityStorage::new(config.max_entities),
             id_to_slot: (0..config.max_entities).map(|_| INVALID_SLOT).collect(),
             free_ids: Vec::new(),
         }
+    }
+
+    pub fn get_ids(&self) -> &Vec<EntityId> {
+        &self.storage.id
+    }
+
+    pub fn get_positions_x(&self) -> &Vec<f32> {
+        &self.storage.position_x
+    }
+
+    pub fn get_positions_y(&self) -> &Vec<f32> {
+        &self.storage.position_y
     }
 
     pub fn insert(
@@ -37,10 +51,8 @@ impl EntityManager {
         mass: f32,
         size: f32,
         sensing_radius: f32,
-    ) {
-        if self.storage.len() >= Config::get_instance().max_entities {
-            return;
-        }
+    ) -> EntityId {
+        assert!(self.storage.len() < Config::get_instance().max_entities);
 
         let id = match self.free_ids.pop() {
             Some(mut id) => id.update_gen(),
@@ -50,10 +62,8 @@ impl EntityManager {
             }
         };
 
-        let entity_id_index = id.index as usize;
-
         let slot = self.storage.insert(
-            id,
+            id.clone(),
             position,
             velocity,
             facing,
@@ -63,7 +73,9 @@ impl EntityManager {
             sensing_radius,
         );
 
-        self.id_to_slot[entity_id_index] = slot;
+        self.id_to_slot[id.index as usize] = slot;
+
+        id
     }
 
     pub fn remove(&mut self, id: EntityId) -> bool {
@@ -108,9 +120,8 @@ impl EntityManager {
 
     pub fn update_velocities(&mut self, dt: f32) {
         let dt_simd = f32x16::splat(dt);
-        let simd_lanes = Config::get_instance().simd_lanes as usize;
 
-        let remainder = self.storage.position_x.len() % simd_lanes;
+        let remainder = self.storage.position_x.len() % self.simd_lanes;
         let simd_len = self.storage.position_x.len() - remainder;
 
         let (vx_simd, vx_tail) = self.storage.velocity_x.split_at_mut(simd_len);
@@ -122,11 +133,11 @@ impl EntityManager {
         let (im_simd, im_tail) = self.storage.inv_mass.split_at(simd_len);
 
         vx_simd
-            .par_chunks_exact_mut(simd_lanes)
-            .zip(vy_simd.par_chunks_exact_mut(simd_lanes))
-            .zip(fx_simd.par_chunks_exact_mut(simd_lanes))
-            .zip(fy_simd.par_chunks_exact_mut(simd_lanes))
-            .zip(im_simd.par_chunks_exact(simd_lanes))
+            .par_chunks_exact_mut(self.simd_lanes)
+            .zip(vy_simd.par_chunks_exact_mut(self.simd_lanes))
+            .zip(fx_simd.par_chunks_exact_mut(self.simd_lanes))
+            .zip(fy_simd.par_chunks_exact_mut(self.simd_lanes))
+            .zip(im_simd.par_chunks_exact(self.simd_lanes))
             .for_each(|((((vx, vy), fx), fy), im)| {
                 let vx_s = f32x16::from(&*vx);
                 let vy_s = f32x16::from(&*vy);
@@ -163,9 +174,8 @@ impl EntityManager {
 
     pub fn update_positions(&mut self, dt: f32) {
         let dt_simd = f32x16::splat(dt);
-        let simd_lanes = Config::get_instance().simd_lanes as usize;
 
-        let remainder = self.storage.position_x.len() % simd_lanes;
+        let remainder = self.storage.position_x.len() % self.simd_lanes;
         let simd_len = self.storage.position_x.len() - remainder;
 
         let (px_simd, px_tail) = self.storage.position_x.split_at_mut(simd_len);
@@ -175,10 +185,10 @@ impl EntityManager {
         let (vy_simd, vy_tail) = self.storage.velocity_y.split_at(simd_len);
 
         px_simd
-            .par_chunks_exact_mut(simd_lanes)
-            .zip(py_simd.par_chunks_exact_mut(simd_lanes))
-            .zip(vx_simd.par_chunks_exact(simd_lanes))
-            .zip(vy_simd.par_chunks_exact(simd_lanes))
+            .par_chunks_exact_mut(self.simd_lanes)
+            .zip(py_simd.par_chunks_exact_mut(self.simd_lanes))
+            .zip(vx_simd.par_chunks_exact(self.simd_lanes))
+            .zip(vy_simd.par_chunks_exact(self.simd_lanes))
             .for_each(|(((px, py), vx), vy)| {
                 let px_v = f32x16::from(&*px);
                 let py_v = f32x16::from(&*py);

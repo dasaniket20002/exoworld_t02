@@ -2,23 +2,21 @@ use std::time::{Duration, Instant};
 
 use crate::{
     entities::{entity_id::EntityId, entity_manager::EntityManager},
-    spatial_db::{collision::CollisionSystem, uniform_grid::UniformGrid},
+    spatial_db::grid_manager::GridManager,
 };
 
 pub struct World {
     pub entity_manager: EntityManager,
-    pub grid: UniformGrid,
-    pub collisions: CollisionSystem,
+    pub grid_manager: GridManager,
+    // pub collisions: CollisionSystem,
 }
 
 impl World {
     pub fn new() -> Self {
         Self {
             entity_manager: EntityManager::new(),
-
-            grid: UniformGrid::new(),
-
-            collisions: CollisionSystem::new(4),
+            grid_manager: GridManager::new(),
+            // collisions: CollisionSystem::new(4),
         }
     }
 
@@ -32,7 +30,7 @@ impl World {
         size: f32,
         sensing_radius: f32,
     ) {
-        self.entity_manager.insert(
+        let id = self.entity_manager.insert(
             position,
             velocity,
             facing,
@@ -42,20 +40,13 @@ impl World {
             sensing_radius,
         );
 
-        // self.grid
-        //     .insert(entity, dense_index, position_x, position_y);
+        self.grid_manager.insert(id, position);
     }
 
     pub fn remove_entity(&mut self, id: EntityId) {
-        self.entity_manager.remove(id);
-
-        // self.grid.remove(entity);
-
-        // let moved = self.entities.remove(entity);
-
-        // if let Some((moved_entity, new_dense_index)) = moved {
-        //     self.grid.update_dense_index(moved_entity, new_dense_index);
-        // }
+        if self.entity_manager.remove(id) {
+            self.grid_manager.remove(id);
+        }
     }
 
     pub fn update(&mut self, dt: f32) {
@@ -111,14 +102,14 @@ impl World {
 
             Only entities that crossed a boundary are moved.
         */
-        // let start = Instant::now();
-        // self.grid.relocate(
-        //     &self.entities.entity_ids,
-        //     &self.entities.position_x,
-        //     &self.entities.position_y,
-        // );
-        // println!("[INFO] Relocated: {:?}", start.elapsed());
-        // duration += start.elapsed();
+        let start = Instant::now();
+        self.grid_manager.relocate(
+            self.entity_manager.get_ids(),
+            self.entity_manager.get_positions_x(),
+            self.entity_manager.get_positions_y(),
+        );
+        println!("[INFO] Relocated: {:?}", start.elapsed());
+        duration += start.elapsed();
 
         println!("[INFO] Total: {:?}", duration);
     }

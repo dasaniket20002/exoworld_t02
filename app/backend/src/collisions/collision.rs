@@ -5,7 +5,7 @@ use wide::f32x16;
 
 use crate::{
     entities::entities_soa::EntitiesSoa, global::config::Config,
-    spatial_db::uniform_grid::UniformGrid,
+    spatial_db::grid_manager::UniformGrid,
 };
 
 const LANES: usize = 16;

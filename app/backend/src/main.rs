@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use crate::global::{config::Config, time::Time, world::World};
 
+// mod collisions;
 mod entities;
 mod global;
 mod spatial_db;
@@ -23,7 +24,7 @@ fn main() {
         let facing_x = fastrand::f32();
         let facing_y = fastrand::f32();
 
-        let radius = fastrand::f32() * (2.25 - 0.75) + 0.75;
+        let radius = fastrand::f32() * (config.sensing_radius_range.1 /* max */ - config.sensing_radius_range.0 /* min */) + config.sensing_radius_range.0 /* min */;
 
         world.add_entity(
             (position_x, position_y),
