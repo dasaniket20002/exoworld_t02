@@ -6,7 +6,16 @@ pub struct EntityId {
 
 impl EntityId {
     #[inline]
-    pub const fn new(index: u32, generation: u32) -> Self {
-        Self { index, generation }
+    pub const fn new(index: u32) -> Self {
+        Self {
+            index,
+            generation: 0,
+        }
+    }
+
+    #[inline]
+    pub fn update_gen(&mut self) -> Self {
+        self.generation += 1;
+        self.to_owned()
     }
 }

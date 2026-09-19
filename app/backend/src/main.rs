@@ -20,10 +20,19 @@ fn main() {
         let velocity_x = fastrand::f32();
         let velocity_y = fastrand::f32();
 
+        let facing_x = fastrand::f32();
+        let facing_y = fastrand::f32();
+
         let radius = fastrand::f32() * (2.25 - 0.75) + 0.75;
 
         world.add_entity(
-            position_x, position_y, velocity_x, velocity_y, 0.0, 0.0, 1.0, radius,
+            (position_x, position_y),
+            (velocity_x, velocity_y),
+            Some((facing_x, facing_y)),
+            None,
+            0.0,
+            1.0,
+            radius,
         );
     });
     println!("[INFO] Spawned in {:?}", start.elapsed());
