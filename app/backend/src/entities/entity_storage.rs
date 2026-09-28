@@ -102,57 +102,57 @@ impl EntityStorage {
         c_idx
     }
 
-    pub fn remove(&mut self, idx: usize) -> (Option<EntityId>, Option<EntityId>) {
-        let last = self.len() - 1;
+    // pub fn remove(&mut self, idx: usize) -> (Option<EntityId>, Option<EntityId>) {
+    //     let last = self.len() - 1;
 
-        let swapped_id = if idx < last {
-            self.id.get(last).copied()
-        } else {
-            None
-        };
+    //     let swapped_id = if idx < last {
+    //         self.id.get(last).copied()
+    //     } else {
+    //         None
+    //     };
 
-        if idx < last {
-            self.id.swap(idx, last);
+    //     if idx < last {
+    //         self.id.swap(idx, last);
 
-            self.position_x.swap(idx, last);
-            self.position_y.swap(idx, last);
+    //         self.position_x.swap(idx, last);
+    //         self.position_y.swap(idx, last);
 
-            self.velocity_x.swap(idx, last);
-            self.velocity_y.swap(idx, last);
+    //         self.velocity_x.swap(idx, last);
+    //         self.velocity_y.swap(idx, last);
 
-            self.facing_x.swap(idx, last);
-            self.facing_y.swap(idx, last);
+    //         self.facing_x.swap(idx, last);
+    //         self.facing_y.swap(idx, last);
 
-            self.force_x.swap(idx, last);
-            self.force_y.swap(idx, last);
+    //         self.force_x.swap(idx, last);
+    //         self.force_y.swap(idx, last);
 
-            self.mass.swap(idx, last);
-            self.inv_mass.swap(idx, last);
+    //         self.mass.swap(idx, last);
+    //         self.inv_mass.swap(idx, last);
 
-            self.size.swap(idx, last);
-            self.sensing_radius.swap(idx, last);
-        }
+    //         self.size.swap(idx, last);
+    //         self.sensing_radius.swap(idx, last);
+    //     }
 
-        let removed_id = self.id.pop();
+    //     let removed_id = self.id.pop();
 
-        self.position_x.pop();
-        self.position_y.pop();
+    //     self.position_x.pop();
+    //     self.position_y.pop();
 
-        self.velocity_x.pop();
-        self.velocity_y.pop();
+    //     self.velocity_x.pop();
+    //     self.velocity_y.pop();
 
-        self.facing_x.pop();
-        self.facing_y.pop();
+    //     self.facing_x.pop();
+    //     self.facing_y.pop();
 
-        self.force_x.pop();
-        self.force_y.pop();
+    //     self.force_x.pop();
+    //     self.force_y.pop();
 
-        self.mass.pop();
-        self.inv_mass.pop();
+    //     self.mass.pop();
+    //     self.inv_mass.pop();
 
-        self.size.pop();
-        self.sensing_radius.pop();
+    //     self.size.pop();
+    //     self.sensing_radius.pop();
 
-        (removed_id, swapped_id)
-    }
+    //     (removed_id, swapped_id)
+    // }
 }

@@ -1,4 +1,4 @@
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockReadGuard};
 
 use crate::entities::entity_id::EntityId;
 
@@ -13,12 +13,9 @@ impl GridCell {
         }
     }
 
-    pub fn for_each(&self, mut f: impl FnMut(EntityId)) {
+    pub fn get_entities(&self) -> RwLockReadGuard<'_, Vec<EntityId>> {
         let entities = self.entities.read();
-
-        for &id in entities.iter() {
-            f(id);
-        }
+        entities
     }
 
     pub fn len(&self) -> usize {
@@ -27,16 +24,20 @@ impl GridCell {
     }
 
     #[inline]
-    pub fn add(&self, id: EntityId) {
+    pub fn add(&self, id: EntityId) -> bool {
         let mut write_lock = self.entities.write();
+        let became_active = write_lock.is_empty();
         write_lock.push(id);
+        became_active
     }
 
     #[inline]
-    pub fn remove(&self, id: EntityId) {
+    pub fn remove(&self, id: EntityId) -> bool {
         let mut write_lock = self.entities.write();
         if let Some(found) = write_lock.iter().position(|&e| e == id) {
             write_lock.swap_remove(found);
+            return write_lock.is_empty();
         }
+        false
     }
 }

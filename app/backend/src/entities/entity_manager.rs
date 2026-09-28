@@ -1,3 +1,6 @@
+use std::sync::OnceLock;
+
+use parking_lot::RwLock;
 use rayon::{
     iter::{IndexedParallelIterator, ParallelIterator},
     slice::{ParallelSlice, ParallelSliceMut},
@@ -18,8 +21,14 @@ pub struct EntityManager {
     free_ids: Vec<EntityId>,
 }
 
+static INSTANCE: OnceLock<RwLock<EntityManager>> = OnceLock::new();
+
 impl EntityManager {
-    pub fn new() -> Self {
+    pub fn get_instance() -> &'static RwLock<EntityManager> {
+        INSTANCE.get_or_init(|| RwLock::new(EntityManager::new()))
+    }
+
+    fn new() -> Self {
         let config = Config::get_instance();
 
         Self {
@@ -30,16 +39,110 @@ impl EntityManager {
         }
     }
 
-    pub fn get_ids(&self) -> &Vec<EntityId> {
+    #[inline]
+    pub fn slot(&self, id: EntityId) -> Option<usize> {
+        let idx = self.id_to_slot[id.index as usize];
+        if idx == INVALID_SLOT {
+            return None;
+        }
+
+        // Stale EntityId / generation mismatch.
+        if self.storage.id[idx] != id {
+            return None;
+        }
+
+        Some(idx)
+    }
+
+    #[inline]
+    pub fn get_ids(&self) -> &[EntityId] {
         &self.storage.id
     }
-
-    pub fn get_positions_x(&self) -> &Vec<f32> {
+    #[inline]
+    pub fn get_positions_x(&self) -> &[f32] {
         &self.storage.position_x
     }
-
-    pub fn get_positions_y(&self) -> &Vec<f32> {
+    #[inline]
+    pub fn get_positions_y(&self) -> &[f32] {
         &self.storage.position_y
+    }
+    #[inline]
+    pub fn get_velocities_x(&self) -> &[f32] {
+        &self.storage.velocity_x
+    }
+    #[inline]
+    pub fn get_velocities_y(&self) -> &[f32] {
+        &self.storage.velocity_y
+    }
+    // #[inline]
+    // pub fn get_facings_x(&self) -> &[f32] {
+    //     &self.storage.facing_x
+    // }
+    // #[inline]
+    // pub fn get_facings_y(&self) -> &[f32] {
+    //     &self.storage.facing_y
+    // }
+    // #[inline]
+    // pub fn get_forces_x(&self) -> &[f32] {
+    //     &self.storage.force_x
+    // }
+    // #[inline]
+    // pub fn get_forces_y(&self) -> &[f32] {
+    //     &self.storage.force_y
+    // }
+    // #[inline]
+    // pub fn get_masses(&self) -> &[f32] {
+    //     &self.storage.mass
+    // }
+    // #[inline]
+    // pub fn get_inv_masses(&self) -> &[f32] {
+    //     &self.storage.inv_mass
+    // }
+    #[inline]
+    pub fn get_sizes(&self) -> &[f32] {
+        &self.storage.size
+    }
+    // #[inline]
+    // pub fn get_sensing_radii(&self) -> &[f32] {
+    //     &self.storage.sensing_radius
+    // }
+
+    // #[inline]
+    // pub fn get_entity_position(&self, id: EntityId) -> Option<(f32, f32)> {
+    //     let idx = self.slot(id)?;
+    //     Some((self.storage.position_x[idx], self.storage.position_y[idx]))
+    // }
+
+    #[inline]
+    pub fn get_entity_velocity(&self, id: EntityId) -> Option<(f32, f32)> {
+        let idx = self.slot(id)?;
+        Some((self.storage.velocity_x[idx], self.storage.velocity_y[idx]))
+    }
+
+    // #[inline]
+    // pub fn get_entity_size(&self, id: EntityId) -> Option<f32> {
+    //     let idx = self.slot(id)?;
+    //     Some(self.storage.size[idx])
+    // }
+
+    #[inline]
+    pub fn get_entity_inv_mass(&self, id: EntityId) -> Option<f32> {
+        let idx = self.slot(id)?;
+        Some(self.storage.inv_mass[idx])
+    }
+
+    pub fn mut_entity_position(&mut self, id: EntityId, delta: (f32, f32)) {
+        if let Some(idx) = self.slot(id) {
+            self.storage.position_x[idx] += delta.0;
+            self.storage.position_y[idx] += delta.1;
+        }
+    }
+
+    pub fn mut_entity_velocity(&mut self, id: EntityId, delta: (f32, f32)) {
+        if let Some(idx) = self.slot(id) {
+            self.storage.velocity_x[idx] += delta.0;
+            self.storage.velocity_y[idx] += delta.1;
+        }
     }
 
     pub fn insert(
@@ -78,45 +181,30 @@ impl EntityManager {
         id
     }
 
-    pub fn remove(&mut self, id: EntityId) -> bool {
-        let idx = self.id_to_slot[id.index as usize];
-        if idx == INVALID_SLOT {
-            return false;
-        }
+    // pub fn remove(&mut self, id: EntityId) -> bool {
+    //     let idx = self.id_to_slot[id.index as usize];
+    //     if idx == INVALID_SLOT {
+    //         return false;
+    //     }
 
-        // Stale EntityId / generation mismatch.
-        if self.storage.id[idx] != id {
-            return false;
-        }
+    //     // Stale EntityId / generation mismatch.
+    //     if self.storage.id[idx] != id {
+    //         return false;
+    //     }
 
-        let (removed_id, swapped_id) = self.storage.remove(idx);
+    //     let (removed_id, swapped_id) = self.storage.remove(idx);
 
-        if let Some(removed_id) = removed_id {
-            self.id_to_slot[removed_id.index as usize] = INVALID_SLOT;
-            self.free_ids.push(removed_id);
-        }
+    //     if let Some(removed_id) = removed_id {
+    //         self.id_to_slot[removed_id.index as usize] = INVALID_SLOT;
+    //         self.free_ids.push(removed_id);
+    //     }
 
-        if let Some(swapped_id) = swapped_id {
-            self.id_to_slot[swapped_id.index as usize] = idx;
-        }
+    //     if let Some(swapped_id) = swapped_id {
+    //         self.id_to_slot[swapped_id.index as usize] = idx;
+    //     }
 
-        true
-    }
-
-    #[inline]
-    pub fn contains(&self, id: EntityId) -> bool {
-        let idx = self.id_to_slot[id.index as usize];
-        if idx == INVALID_SLOT {
-            return false;
-        }
-
-        // Stale EntityId / generation mismatch.
-        if self.storage.id[idx] != id {
-            return false;
-        }
-
-        true
-    }
+    //     true
+    // }
 
     pub fn update_velocities(&mut self, dt: f32) {
         let dt_simd = f32x16::splat(dt);
